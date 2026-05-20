@@ -1,0 +1,615 @@
+WEBVIEW LIFECYCLE — EXPLAINED
+=============================
+
+This file explains the VS Code webview lifecycle using code samples
+from the official docs. Read this alongside your Day 1 code.
+
+
+=============================
+1. CREATE — Birth of a Webview
+=============================
+
+  const panel = vscode.window.createWebviewPanel(
+    'catCoding',      // internal ID (like a type name)
+    'Cat Coding',     // tab title the user sees
+    vscode.ViewColumn.One,  // which editor column
+    { enableScripts: true } // options, enabling JavaScript for interaction with the HTML webpage
+  );
+
+  panel.webview.html = getWebviewContent();
+
+WHAT HAPPENS:
+- A new tab opens in VS Code with your HTML inside it.
+- You get back a `panel` object — this is your ONLY handle to the webview.
+- If you lose this reference (e.g. it goes out of scope), you can never
+  access that webview again, even though the user can still see it.
+  NOTE: "lose reference" does NOT mean the webview becomes static.
+  The webview's own JavaScript (buttons, scripts) still runs fine.
+  What breaks is the extension-to-webview connection — you can't
+  call panel.webview.postMessage() or panel.dispose() anymore.
+  Think of it as: the frontend is alive but orphaned from the backend.
+
+YOUR CODE EQUIVALENT:
+  const panel = vscode.window.createWebviewPanel(
+    'zygotePanel', 'Zygote', vscode.ViewColumn.Beside,
+    { enableScripts: true }
+  );
+
+
+=============================
+2. VISIBLE / HIDDEN — The Tab Switch Problem
+=============================
+
+When the user clicks away to another tab, your webview becomes HIDDEN.
+  "Another tab" = any other editor tab in VS Code (e.g. clicking on
+  package.json, README.md, or any file while the Zygote webview is open).
+
+KEY BEHAVIOR: VS Code can DESTROY your webview's content while hidden
+to save memory. When the user clicks back, your HTML/JS state is GONE.
+  NOTE: This is DIFFERENT from losing the panel reference (Section 1).
+  Here, your extension still has the panel variable and can call
+  postMessage(). But the webview's INTERNAL state (typed input, replies,
+  JS variables) is wiped by VS Code. The backend connection is fine —
+  it's the frontend that got reset to its initial HTML.
+
+Like one-time webpage fresh
+
+  panel.onDidChangeViewState(e => {
+    const panel = e.webviewPanel;
+    // panel.visible === true  -> user is looking at it
+    // panel.visible === false -> user switched to another tab
+  });
+
+YOUR CODE: Does NOT handle this. If a user switches tabs mid-conversation
+with Claude, the reply div and input text could be wiped.
+
+THREE WAYS TO FIX THIS:
+
+  Option A: retainContextWhenHidden (easiest, most expensive)
+  ----------------------------------------------------------
+  const panel = vscode.window.createWebviewPanel(
+    'zygotePanel', 'Zygote', vscode.ViewColumn.Beside,
+    { enableScripts: true, retainContextWhenHidden: true }
+  );
+
+  This tells VS Code: "never destroy my content." Your webview stays
+  alive in the background like a browser tab. Simple but uses more RAM.
+
+  Option B: getState / setState (recommended)
+  -------------------------------------------
+  Inside the webview script:
+
+    const vscode = acquireVsCodeApi();
+
+    // Save state whenever it changes
+    vscode.setState({ count: 42, messages: [...] });
+
+    // Restore state when webview is recreated
+    const previousState = vscode.getState();
+    if (previousState) {
+      // rebuild your UI from saved state
+    }
+
+  This survives the webview being destroyed and recreated.
+  Lower memory cost than retainContextWhenHidden.
+
+  Option C: Rebuild from extension side
+  --------------------------------------
+  The extension keeps the state, and re-sends it to the webview
+  when it becomes visible again. More complex but most flexible.
+
+
+=============================
+3. DESTROYED — The User Closes the Tab
+=============================
+
+When the user closes the webview tab (clicks X), the panel is destroyed.
+
+  panel.onDidDispose(() => {
+    // This fires when the webview is closed
+    // Clean up: cancel timers, close connections, free memory
+    clearInterval(interval);
+  });
+
+WHY THIS MATTERS:
+Without cleanup, resources leak. If you have a setInterval running,
+it keeps running even after the webview is closed. If you have an
+API connection, it stays open.
+
+YOUR CODE: Does NOT handle this. If the user closes the Zygote panel
+while Claude is "Thinking...", the API call finishes but has nowhere
+to send the response. No crash, but wasted resources.
+
+PROGRAMMATIC DISPOSAL:
+You can also close the webview from code:
+
+  panel.dispose();  // closes the webview tab
+
+
+=============================
+4. SINGLE PANEL PATTERN — Only One Instance
+=============================
+
+Problem: Running "Zygote is a dream" 5 times creates 5 panels.
+
+Solution: Track the current panel and reuse it.
+
+  let currentPanel: vscode.WebviewPanel | undefined = undefined;
+
+  vscode.commands.registerCommand('zygote.is.a.dream', () => {
+    if (currentPanel) {
+      // Panel already exists — just bring it to front
+      currentPanel.reveal(vscode.ViewColumn.Beside);
+    } else {
+      // Create new panel
+      currentPanel = vscode.window.createWebviewPanel(...);
+
+      // When user closes it, clear the reference
+      currentPanel.onDidDispose(() => {
+        currentPanel = undefined;
+      });
+    }
+  });
+
+YOUR CODE: Does NOT do this. Every command invocation creates a new panel.
+For Zygote, you want exactly one panel — this pattern is essential.
+
+
+=============================
+5. SERIALIZATION — Survive VS Code Restart
+=============================
+
+When VS Code restarts, all webviews are destroyed. To restore them:
+
+THE FULL FLOW:
+
+  BEFORE RESTART (webview saves state):
+    // Inside webview script — save state whenever it changes
+    const vscode = acquireVsCodeApi();
+    vscode.setState({ messages: [...], currentBranch: 'main' });
+
+  VS CODE RESTARTS...
+
+  AFTER RESTART (extension restores webview):
+    Step 1 — package.json tells VS Code to wake up the extension
+    when it sees a webview of this type needs restoring:
+      "activationEvents": ["onWebviewPanel:zygotePanel"]
+
+    Step 2 — Register a serializer in activate():
+      export function activate(context: vscode.ExtensionContext) {
+        // ... normal setup ...
+
+        vscode.window.registerWebviewPanelSerializer('zygotePanel',
+          new ZygoteSerializer()
+        );
+      }
+
+    Step 3 — The serializer class rebuilds the webview:
+      class ZygoteSerializer implements vscode.WebviewPanelSerializer {
+        async deserializeWebviewPanel(
+          panel: vscode.WebviewPanel,  // VS Code gives you a new panel
+          state: any                   // the state saved by setState()
+        ) {
+          // Rebuild the HTML
+          panel.webview.html = getWebviewContent();
+
+          // Re-attach event listeners (postMessage handlers etc.)
+          panel.webview.onDidReceiveMessage(message => { ... });
+
+          // Use saved state to restore UI
+          // e.g. send previous messages back to the webview
+          if (state && state.messages) {
+            panel.webview.postMessage({
+              type: 'restore',
+              messages: state.messages
+            });
+          }
+        }
+      }
+
+  RESULT: User reopens VS Code -> webview reappears automatically
+  with its previous state, as if nothing happened.
+
+KEY DETAIL: The serializer receives a FRESH panel from VS Code.
+You must re-attach ALL event listeners (onDidReceiveMessage, etc.)
+because the old ones were destroyed with the old panel.
+
+YOUR CODE: Does NOT do this. If VS Code restarts, the Zygote panel
+is gone and the user must re-run the command. For v0.1 this is fine.
+For production Zygote, you'd want this so users don't lose their
+conversation history and tree state on restart.
+
+
+=============================
+6. MESSAGE PASSING — The Two-Way Bridge
+=============================
+
+This is the part your code DOES handle well.
+
+WEBVIEW -> EXTENSION (your code does this):
+  // In webview script:
+  const vscode = acquireVsCodeApi();
+  vscode.postMessage({ text: 'hello' });
+
+  // In extension:
+  panel.webview.onDidReceiveMessage(message => {
+    // message.text === 'hello'
+  });
+
+EXTENSION -> WEBVIEW (your code does this too):
+  // In extension:
+  panel.webview.postMessage({ type: 'reply', text: 'world' });
+
+  // In webview script:
+  window.addEventListener('message', event => {
+    // event.data.type === 'reply'
+    // event.data.text === 'world'
+  });
+
+IMPORTANT: acquireVsCodeApi() can only be called ONCE per webview.
+Store the result and reuse it. Never call it twice.
+
+
+=============================
+7. CONTENT SECURITY POLICY (CSP)
+=============================
+
+Your code has this in the HTML <head>:
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">
+
+What each part means:
+  default-src 'none'     -> Block EVERYTHING by default (images, scripts, styles, fonts)
+  script-src 'unsafe-inline' -> Allow <script> tags written directly in HTML
+  style-src 'unsafe-inline'  -> Allow <style> tags written directly in HTML
+
+'unsafe-inline' is fine for Phase 1 but NOT for production. The safe way:
+  1. Put scripts in separate .js files
+  2. Use a nonce (random token) to whitelist specific scripts:
+
+  const nonce = getNonce(); // generate random string
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'nonce-${nonce}';">
+  <script nonce="${nonce}">
+    // your code here
+  </script>
+
+
+=============================
+8. COLUMN-AWARE VIEWS — Adapt UI to Panel Position
+=============================
+
+The webview can detect WHICH COLUMN it's in and change its content
+accordingly. This uses onDidChangeViewState (same event from Section 2).
+
+  panel.onDidChangeViewState(e => {
+    const panel = e.webviewPanel;
+    switch (panel.viewColumn) {
+      case vscode.ViewColumn.One:
+        // Full view — user dragged panel to main editor area
+        updateWebview(panel, 'full');
+        return;
+      case vscode.ViewColumn.Two:
+        // Side view — panel is beside the editor
+        updateWebview(panel, 'compact');
+        return;
+    }
+  });
+
+HOW THIS HELPS ZYGOTE:
+The user can drag the Zygote panel around, and it adapts:
+
+  Column 1 (main area):  Full tree view + chat + diff preview
+  Column 2 (side panel): Compact chat-only mode
+  Column 3 (far right):  Minimal status view (agent running/idle)
+
+This is a real UX advantage over competitors like Copilot Chat, which
+show the same fixed layout regardless of where the panel sits. Zygote
+could offer a responsive experience — wide layout when there's space,
+compact layout when squeezed into a sidebar.
+
+IMPLEMENTATION PATTERN:
+  function updateWebview(panel: vscode.WebviewPanel, mode: 'full' | 'compact') {
+    panel.title = mode === 'full' ? 'Zygote' : 'Zygote (compact)';
+    panel.webview.html = getWebviewContent(mode);
+  }
+
+  function getWebviewContent(mode: 'full' | 'compact') {
+    if (mode === 'compact') {
+      // Return minimal HTML — just chat input and reply
+      return `...`;
+    }
+    // Return full HTML — tree, chat, file viewer, etc.
+    return `...`;
+  }
+
+YOUR CODE: Does NOT do this. The webview shows the same layout
+everywhere. For v0.1 this is fine. Consider adding this in Week 2+
+when the UI gets more complex with React.
+
+
+=============================
+9. DEVELOPER TOOLS — Debugging the Webview
+=============================
+
+Your webview is a web page. You debug it the same way — with DevTools.
+
+HOW TO OPEN:
+  1. In the Extension Development Host window:
+     Cmd+Shift+P -> "Developer: Toggle Developer Tools"
+  2. A Chrome DevTools panel opens attached to your webview.
+
+WHAT YOU CAN DO:
+  Console tab   -> See console.log() output from your webview scripts.
+                   JavaScript errors show up here too.
+  Elements tab  -> Inspect the DOM. See your HTML structure, edit CSS live.
+  Network tab   -> See outgoing requests (useful when webview loads
+                   external resources like images or fonts).
+
+MOST COMMON USES FOR ZYGOTE:
+  - CSP errors: "Refused to execute inline script..." shows in Console.
+    This means your Content-Security-Policy is blocking something.
+  - Message debugging: Add console.log() in your webview script to see
+    what messages are being sent/received:
+      vscode.postMessage({ text });
+      console.log('Sent:', text);       // <-- shows in DevTools Console
+  - Layout issues: Use Elements tab to inspect why the UI looks wrong.
+
+ALSO USEFUL:
+  Cmd+Shift+P -> "Developer: Reload Webview"
+    Refreshes the webview without restarting the whole extension.
+    Faster than stopping and re-running F5.
+
+NO SETUP NEEDED. Already built into VS Code. Just remember it exists
+and open it first whenever something breaks in the webview.
+
+
+=============================
+10. LOCAL RESOURCE LOADING — Safe File Access in Webviews
+=============================
+
+Webviews are sandboxed. They CANNOT load files using normal paths
+like file:///Users/you/project/image.png. This is a security rule.
+
+To load local files (images, CSS, JS), you must convert the path:
+
+  // Step 1: Build the path to a file inside your EXTENSION'S project folder
+  // context.extensionUri = the root of YOUR extension (e.g. hello-zygote/)
+  // 'media' = a subfolder YOU create inside the extension project:
+  //   hello-zygote/
+  //     src/
+  //     media/       <-- THIS folder, bundled with the extension
+  //       cat.gif
+  //     package.json
+  // This is NOT the user's Desktop, Downloads, or workspace.
+  const filePath = vscode.Uri.joinPath(context.extensionUri, 'media', 'cat.gif');
+
+  // Step 2: Convert to a safe URI the webview is allowed to load
+  const safeUri = panel.webview.asWebviewUri(filePath);
+
+  // Step 3: Use it in HTML like any normal URL
+  panel.webview.html = `<img src="${safeUri}" />`;
+
+WHAT asWebviewUri DOES:
+  Converts: file:///Users/you/extension/media/cat.gif
+  Into:     vscode-webview://abc123/media/cat.gif
+  The webview can load vscode-webview:// URIs but not file:// URIs.
+
+WORKS FOR ANY FILE TYPE:
+  Images:  <img src="${safeUri}" />
+  CSS:     <link rel="stylesheet" href="${safeUri}" />
+  JS:      <script src="${safeUri}"></script>
+
+RESTRICTING ACCESS with localResourceRoots:
+  By default, webviews can access files in your extension folder and
+  the user's workspace. You can lock this down further:
+
+  const panel = vscode.window.createWebviewPanel(
+    'zygotePanel', 'Zygote', vscode.ViewColumn.Beside,
+    {
+      enableScripts: true,
+      localResourceRoots: [
+        vscode.Uri.joinPath(context.extensionUri, 'media')
+      ]
+    }
+  );
+
+  Now the webview can ONLY load files from the 'media' folder.
+  Everything else is blocked. Good for security.
+
+WHY THIS IS BETTER THAN YOUR CODE:
+  Your code reads files with vscode.workspace.fs.readFile() and sends
+  the content as text via postMessage. This works for text files but
+  fails for images/PDFs (garbled binary data).
+
+  The asWebviewUri approach lets the webview load files DIRECTLY —
+  images render as images, not as garbled text. For Zygote, this is
+  how you'd display things like syntax-highlighted code previews,
+  icons, or custom fonts in the webview.
+
+YOUR CODE: Uses postMessage for file content (text only).
+Production Zygote should use asWebviewUri for static assets (images,
+CSS, JS bundles) and postMessage for dynamic content (Claude replies,
+file text the user asked to read).
+
+
+=============================
+11. CONTEXT MENUS — Right-Click Actions Per Zone
+=============================
+
+You can add custom right-click menus to different areas of your webview.
+This requires TWO parts working together:
+
+PART 1 — HTML: Label zones with data-vscode-context
+  <div data-vscode-context='{"webviewSection": "tree"}'>
+    <!-- tree view area -->
+  </div>
+  <div data-vscode-context='{"webviewSection": "chat"}'>
+    <!-- chat area -->
+  </div>
+
+PART 2 — package.json: Register menu items and conditions
+  "contributes": {
+    "menus": {
+      "webview/context": [
+        {
+          "command": "zygote.runAgent",
+          "when": "webviewId == 'zygotePanel' && webviewSection == 'tree'"
+        },
+        {
+          "command": "zygote.copyResponse",
+          "when": "webviewId == 'zygotePanel' && webviewSection == 'chat'"
+        }
+      ]
+    }
+  }
+
+HOW THEY CONNECT:
+  HTML labels the zones -> package.json matches the zone name ->
+  different right-click options appear depending on WHERE you click.
+
+HOW THIS HELPS ZYGOTE:
+  Right-click on a tree branch  -> "Run agent", "Delete branch", "Fork"
+  Right-click on a chat message -> "Copy", "Retry", "Edit prompt"
+  Right-click on a diff view    -> "Accept change", "Reject", "Edit"
+
+  Each zone gets its own relevant actions. Users expect this — it's
+  how VS Code's own editor, file explorer, and terminal all work.
+
+BONUS — preventDefaultContextMenuItems:
+  Add this to suppress VS Code's default right-click items (copy, paste):
+  data-vscode-context='{"webviewSection": "chat", "preventDefaultContextMenuItems": true}'
+  Use this when your custom menu fully replaces the default one.
+
+YOUR CODE: Does NOT do this. No right-click menus exist.
+Add in Week 2+ when the UI has distinct zones to act on.
+
+
+=============================
+12. EXTERNAL COMMANDS — Control Webview from Command Palette
+=============================
+
+You can register extra commands that send messages INTO the webview
+from outside it. Like keyboard shortcuts for your webview.
+
+  // Register a second command (separate from the one that opens the panel)
+  vscode.commands.registerCommand('zygote.runAgent', () => {
+    if (!currentPanel) return;  // do nothing if webview isn't open
+    currentPanel.webview.postMessage({ command: 'runAgent' });
+  });
+
+  // In the webview script, handle it:
+  window.addEventListener('message', event => {
+    if (event.data.command === 'runAgent') {
+      // start agent run from here
+    }
+  });
+
+THE FLOW:
+  User presses Cmd+Shift+P -> types "Zygote: Run Agent" ->
+  extension sends message -> webview receives and acts on it.
+
+  User never needs to click inside the webview. Can also bind
+  these commands to keyboard shortcuts (e.g. Cmd+Shift+R).
+
+ZYGOTE EXAMPLES:
+  "Zygote: Run Agent"    -> start agent on current branch
+  "Zygote: Stop Agent"   -> cancel running agent
+  "Zygote: Show Tree"    -> bring webview to front
+  "Zygote: New Branch"   -> create a new branch in the tree
+
+YOUR CODE: Only has one command (zygote.is.a.dream) that opens
+the panel. Production Zygote would have several commands that
+control the webview without clicking inside it.
+
+
+=============================
+13. PATTERNS WORTH ADOPTING
+=============================
+
+Three techniques from the official docs that improve your code:
+
+A. EVENT-DRIVEN MESSAGING — auto-notify without user clicks
+  setInterval(() => {
+    if (someCondition) {
+      vscode.postMessage({ command: 'alert', text: 'Something happened' });
+    }
+  }, 100);
+
+  The webview monitors a condition and sends a message automatically.
+  No button click needed. For Zygote: agent auto-notifies the
+  extension when it finishes, hits an error, or needs approval.
+
+B. IIFE WRAPPER — keep variables private
+  (function() {
+    const vscode = acquireVsCodeApi();
+    // all code inside here
+  }())
+
+  Wraps the script so nothing leaks to the global scope.
+  Security best practice. Your code exposes `vscode` globally —
+  production Zygote should wrap it like this.
+
+C. THREE NOTIFICATION LEVELS — match severity
+  vscode.window.showInformationMessage(text);  // blue — info
+  vscode.window.showWarningMessage(text);      // yellow — warning
+  vscode.window.showErrorMessage(text);        // red — error
+
+  Your code only uses showInformationMessage. For Zygote:
+    Info:    "Agent finished successfully"
+    Warning: "Token limit 80% reached"
+    Error:   "Agent failed — API key invalid"
+
+
+=============================
+14. [ADVANCED] WEB WORKERS — Background Threads in Webview
+=============================
+
+Web Workers run JavaScript in a BACKGROUND THREAD so heavy
+computation doesn't freeze the webview UI.
+
+HOW TO LOAD A WORKER IN A WEBVIEW:
+  // Can't use new Worker('path') directly — webview security blocks it.
+  // Must fetch the file, convert to blob, then create worker from blob.
+  fetch(workerSource)
+    .then(result => result.blob())
+    .then(blob => {
+      const blobUrl = URL.createObjectURL(blob);
+      new Worker(blobUrl);      // starts background thread
+    });
+
+The worker JS file must be bundled into a single file (webpack with
+maxChunks: 1) because web workers can only load one script.
+
+ZYGOTE USE CASES:
+  - Parsing large tree structures without freezing the UI
+  - Diffing files in the background
+  - Syntax highlighting large code blocks
+
+NOT NEEDED NOW. Only consider this if the webview starts feeling
+sluggish under heavy data. This is a performance optimization,
+not a feature requirement.
+
+
+=============================
+LIFECYCLE SUMMARY — WHAT YOUR CODE IS MISSING
+=============================
+
+  FEATURE                  | YOUR CODE | PRODUCTION ZYGOTE
+  -------------------------+-----------+------------------
+  Create panel             |    YES    |    YES
+  Set HTML content         |    YES    |    YES
+  Enable scripts           |    YES    |    YES
+  Message: webview->ext    |    YES    |    YES
+  Message: ext->webview    |    YES    |    YES
+  onDidDispose cleanup     |    NO     |    NEEDED
+  Single panel pattern     |    NO     |    NEEDED
+  State persistence        |    NO     |    NEEDED
+  Survive restart          |    NO     |    NICE TO HAVE
+  CSP with nonces          |    NO     |    NEEDED
+  retainContextWhenHidden  |    NO     |    PROBABLY
+  Column-aware views       |    NO     |    DIFFERENTIATOR
+
+This is exactly where you're supposed to be after Phase 1.
+You built the working path. Week 1+ adds the production patterns.
+
