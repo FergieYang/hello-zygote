@@ -11,7 +11,8 @@
 			"request": "launch",
 			"args": [
 				"--extensionDevelopmentPath=${workspaceFolder}",
-				"--disable-extensions"
+				"--disable-extensions",
+				"/Users/Fergie/Desktop/zygoteai/test-workspace"
 			],
 			"outFiles": [
 				"${workspaceFolder}/out/**/*.js"
